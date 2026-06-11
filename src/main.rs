@@ -116,7 +116,13 @@ fn main() {
         .insert_resource(RunningProcesses::default())
         .insert_resource(InitialPath(initial_path))
         .add_event::<UpdateUiEvent>()
-        .add_systems(Startup, (setup_fonts, setup_3d_background, setup_ui, init_launcher, initial_launch_system))
+        .add_systems(Startup, (
+            setup_fonts,
+            setup_ui,
+            setup_3d_background,
+            init_launcher,
+            initial_launch_system,
+        ).chain())
         .add_systems(Update, (
             process_dialog_returns,
             monitor_processes,
