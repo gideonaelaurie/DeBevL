@@ -11,6 +11,9 @@ mod launcher;
 use config::{load_config, save_config, LauncherConfig, Project};
 use launcher::{detect_project_type, launch_project, ProjectType};
 
+use bevy::app::AppExit;
+use serde::Deserialize;
+
 // Events
 #[derive(Event)]
 struct UpdateUiEvent;
@@ -22,12 +25,22 @@ struct ProjectListContainer;
 #[derive(Component)]
 struct ProjectCard;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Resource)]
+enum ActiveTab {
+    #[default]
+    MyGames,
+    Store,
+}
+
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 enum ButtonType {
     SelectFolder,
     Launch,
     Stop,
     Delete,
+    Tab(ActiveTab),
+    OpenLink,
+    Quit,
 }
 
 #[derive(Component, Clone)]
@@ -36,6 +49,9 @@ enum ButtonAction {
     Launch(PathBuf),
     Stop(PathBuf),
     Delete(PathBuf),
+    SwitchTab(ActiveTab),
+    OpenUrl(String),
+    Quit,
 }
 
 #[derive(Component)]
@@ -76,6 +92,46 @@ enum ProjectStatus {
     Invalid,
 }
 
+#[derive(Debug, Clone)]
+struct StoreGameItem {
+    name: String,
+    owner: String,
+    description: String,
+    stars: u32,
+    url: String,
+}
+
+#[derive(Resource, Default)]
+struct StoreGames {
+    items: Vec<StoreGameItem>,
+    loading: bool,
+    error: Option<String>,
+}
+
+#[derive(Resource)]
+struct StoreChannel {
+    rx: Mutex<Receiver<Result<Vec<StoreGameItem>, String>>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GithubOwner {
+    login: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GithubRepoItem {
+    name: String,
+    html_url: String,
+    description: Option<String>,
+    stargazers_count: u32,
+    owner: GithubOwner,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GithubSearchResponse {
+    items: Vec<GithubRepoItem>,
+}
+
 #[derive(Resource)]
 struct InitialPath(Option<PathBuf>);
 
@@ -100,6 +156,10 @@ fn main() {
     // Create channel for the file dialog
     let (tx, rx) = channel::<PathBuf>();
 
+    // Create channel for GitHub store
+    let (store_tx, store_rx) = channel::<Result<Vec<StoreGameItem>, String>>();
+    fetch_store_games(store_tx);
+
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -112,7 +172,9 @@ fn main() {
         .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.04)))
         .insert_resource(config)
         .insert_resource(DialogChannel { tx, rx: Mutex::new(rx) })
-
+        .insert_resource(ActiveTab::default())
+        .insert_resource(StoreGames { loading: true, ..default() })
+        .insert_resource(StoreChannel { rx: Mutex::new(store_rx) })
         .insert_resource(RunningProcesses::default())
         .insert_resource(InitialPath(initial_path))
         .add_event::<UpdateUiEvent>()
@@ -125,14 +187,98 @@ fn main() {
         ).chain())
         .add_systems(Update, (
             process_dialog_returns,
+            process_store_returns,
             monitor_processes,
             handle_ui_buttons,
             button_system,
             card_hover_system,
+            update_tab_buttons,
             update_ui_list,
             animate_background,
         ))
         .run();
+}
+
+fn fetch_store_games(tx: Sender<Result<Vec<StoreGameItem>, String>>) {
+    std::thread::spawn(move || {
+        let url = "https://api.github.com/search/repositories?q=topic:bevy+topic:game&sort=stars&order=desc";
+        let request = ureq::get(url).set("User-Agent", "DeBevL-Game-Launcher");
+        
+        match request.call() {
+            Ok(response) => {
+                match response.into_json::<GithubSearchResponse>() {
+                    Ok(search_res) => {
+                        let mut items = Vec::new();
+                        // Query the top 5 Bevy games
+                        for item in search_res.items.into_iter().take(5) {
+                            let owner = item.owner.login.clone();
+                            let repo_name = item.name.clone();
+                            let readme_url = format!("https://api.github.com/repos/{}/{}/readme", owner, repo_name);
+                            
+                            // Fallback to repository description if README is missing or rate-limited
+                            let mut description = item.description.clone().unwrap_or_default();
+                            
+                            if let Ok(readme_resp) = ureq::get(&readme_url)
+                                .set("User-Agent", "DeBevL-Game-Launcher")
+                                .set("Accept", "application/vnd.github.raw")
+                                .call()
+                            {
+                                if let Ok(readme_text) = readme_resp.into_string() {
+                                    let cleaned = clean_readme(&readme_text);
+                                    if !cleaned.is_empty() {
+                                        description = cleaned;
+                                    }
+                                }
+                            }
+                            
+                            if description.is_empty() {
+                                description = "No description provided.".to_string();
+                            }
+
+                            items.push(StoreGameItem {
+                                name: repo_name,
+                                owner,
+                                description,
+                                stars: item.stargazers_count,
+                                url: item.html_url,
+                            });
+                        }
+                        let _ = tx.send(Ok(items));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("JSON Parse Error: {}", e)));
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(Err(format!("Network Error: {}", e)));
+            }
+        }
+    });
+}
+
+fn clean_readme(readme: &str) -> String {
+    let mut clean: String = readme
+        .lines()
+        .map(|line| line.trim())
+        // Filter out empty lines, markdown headers, links, badges, images, and code blocks
+        .filter(|line| {
+            !line.is_empty()
+                && !line.starts_with('#')
+                && !line.starts_with('[')
+                && !line.starts_with('<')
+                && !line.starts_with('!')
+                && !line.starts_with("```")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if clean.len() > 180 {
+        clean.truncate(177);
+        clean.push_str("...");
+    }
+
+    clean
 }
 
 // Startup systems
@@ -317,24 +463,112 @@ fn setup_ui(mut commands: Commands, fonts: Res<AppFonts>) {
                     ));
                 });
 
-                // "Select Folder" Button
-                header.spawn((
+                // Controls Block (Select Folder & Quit)
+                header.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(12.0),
+                    align_items: AlignItems::Center,
+                    ..default()
+                }).with_children(|controls| {
+                    // "Select Folder" Button
+                    controls.spawn((
+                        Button,
+                        Node {
+                            padding: UiRect::new(Val::Px(16.0), Val::Px(16.0), Val::Px(10.0), Val::Px(10.0)),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                        BorderRadius::all(Val::Px(8.0)),
+                        BackgroundColor(Color::srgb(0.08, 0.45, 0.9)),
+                        ButtonType::SelectFolder,
+                        ButtonAction::SelectFolder,
+                    )).with_child((
+                        Text::new("Select Game Folder..."),
+                        TextFont {
+                            font: fonts.semibold.clone(),
+                            font_size: 14.0,
+                            ..default()
+                        },
+                        TextColor(Color::WHITE),
+                    ));
+
+                    // "Quit" Button
+                    controls.spawn((
+                        Button,
+                        Node {
+                            padding: UiRect::new(Val::Px(16.0), Val::Px(16.0), Val::Px(10.0), Val::Px(10.0)),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                        BorderRadius::all(Val::Px(8.0)),
+                        BackgroundColor(Color::srgb(0.7, 0.1, 0.1)),
+                        ButtonType::Quit,
+                        ButtonAction::Quit,
+                    )).with_child((
+                        Text::new("Quit"),
+                        TextFont {
+                            font: fonts.semibold.clone(),
+                            font_size: 14.0,
+                            ..default()
+                        },
+                        TextColor(Color::WHITE),
+                    ));
+                });
+            });
+
+            // Tab Navigation Bar
+            panel.spawn(Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Row,
+                column_gap: Val::Px(12.0),
+                margin: UiRect::bottom(Val::Px(12.0)),
+                ..default()
+            }).with_children(|tabs| {
+                // "My Games" Tab Button
+                tabs.spawn((
                     Button,
                     Node {
-                        padding: UiRect::new(Val::Px(16.0), Val::Px(16.0), Val::Px(10.0), Val::Px(10.0)),
+                        padding: UiRect::new(Val::Px(16.0), Val::Px(16.0), Val::Px(8.0), Val::Px(8.0)),
                         justify_content: JustifyContent::Center,
                         align_items: AlignItems::Center,
                         ..default()
                     },
-                    BorderRadius::all(Val::Px(8.0)),
-                    BackgroundColor(Color::srgb(0.08, 0.45, 0.9)),
-                    ButtonType::SelectFolder,
-                    ButtonAction::SelectFolder,
+                    BorderRadius::all(Val::Px(6.0)),
+                    BackgroundColor(Color::srgb(0.08, 0.45, 0.9)), // Active by default
+                    BorderColor(Color::srgb(0.0, 0.8, 1.0)),
+                    ButtonType::Tab(ActiveTab::MyGames),
+                    ButtonAction::SwitchTab(ActiveTab::MyGames),
                 )).with_child((
-                    Text::new("Select Game Folder..."),
+                    Text::new("My Games"),
                     TextFont {
                         font: fonts.semibold.clone(),
-                        font_size: 14.0,
+                        font_size: 13.0,
+                        ..default()
+                    },
+                    TextColor(Color::WHITE),
+                ));
+
+                // "GitHub Store" Tab Button
+                tabs.spawn((
+                    Button,
+                    Node {
+                        padding: UiRect::new(Val::Px(16.0), Val::Px(16.0), Val::Px(8.0), Val::Px(8.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
+                    BorderRadius::all(Val::Px(6.0)),
+                    BackgroundColor(Color::srgba(0.12, 0.12, 0.15, 0.6)), // Inactive by default
+                    BorderColor(Color::srgba(0.2, 0.25, 0.35, 0.35)),
+                    ButtonType::Tab(ActiveTab::Store),
+                    ButtonAction::SwitchTab(ActiveTab::Store),
+                )).with_child((
+                    Text::new("GitHub Store"),
+                    TextFont {
+                        font: fonts.semibold.clone(),
+                        font_size: 13.0,
                         ..default()
                     },
                     TextColor(Color::WHITE),
@@ -350,20 +584,6 @@ fn setup_ui(mut commands: Commands, fonts: Res<AppFonts>) {
                     ..default()
                 },
                 BackgroundColor(Color::srgba(0.2, 0.25, 0.35, 0.3)),
-            ));
-
-            // Section Title
-            panel.spawn(Node {
-                margin: UiRect::bottom(Val::Px(12.0)),
-                ..default()
-            }).with_child((
-                Text::new("My Bevy Games"),
-                TextFont {
-                    font: fonts.semibold.clone(),
-                    font_size: 16.0,
-                    ..default()
-                },
-                TextColor(Color::WHITE),
             ));
 
             // Project List Scroll/Column Container
@@ -587,6 +807,8 @@ fn handle_ui_buttons(
     running: Res<RunningProcesses>,
     dialog_channel: Res<DialogChannel>,
     mut ui_events: EventWriter<UpdateUiEvent>,
+    mut active_tab: ResMut<ActiveTab>,
+    mut app_exit: EventWriter<AppExit>,
 ) {
     for (interaction, action) in &interaction_query {
         if *interaction == Interaction::Pressed {
@@ -649,6 +871,16 @@ fn handle_ui_buttons(
                     save_config(&config);
                     ui_events.send(UpdateUiEvent);
                 }
+                ButtonAction::SwitchTab(tab) => {
+                    *active_tab = *tab;
+                    ui_events.send(UpdateUiEvent);
+                }
+                ButtonAction::OpenUrl(url) => {
+                    let _ = webbrowser::open(url);
+                }
+                ButtonAction::Quit => {
+                    app_exit.send(AppExit::Success);
+                }
             }
         }
     }
@@ -656,6 +888,7 @@ fn handle_ui_buttons(
 
 // Button styling and animation
 fn button_system(
+    active_tab: Res<ActiveTab>,
     mut interaction_query: Query<
         (&Interaction, &mut BackgroundColor, &mut BorderColor, &ButtonType),
         (Changed<Interaction>, With<Button>),
@@ -710,6 +943,44 @@ fn button_system(
                     *border_color = Color::srgba(0.3, 0.3, 0.3, 0.5).into();
                 }
             },
+            ButtonType::Tab(tab) => {
+                let is_active = *tab == *active_tab;
+                match interaction {
+                    Interaction::Pressed => {
+                        *bg_color = if is_active { Color::srgb(0.06, 0.35, 0.75).into() } else { Color::srgba(0.2, 0.2, 0.25, 0.8).into() };
+                    }
+                    Interaction::Hovered => {
+                        *bg_color = if is_active { Color::srgb(0.12, 0.55, 1.0).into() } else { Color::srgba(0.25, 0.25, 0.3, 0.8).into() };
+                        *border_color = Color::srgba(0.0, 0.8, 1.0, 0.6).into();
+                    }
+                    Interaction::None => {
+                        *bg_color = if is_active { Color::srgb(0.08, 0.45, 0.9).into() } else { Color::srgba(0.12, 0.12, 0.15, 0.6).into() };
+                        *border_color = if is_active { Color::srgb(0.0, 0.8, 1.0).into() } else { Color::srgba(0.2, 0.25, 0.35, 0.35).into() };
+                    }
+                }
+            }
+            ButtonType::OpenLink => match interaction {
+                Interaction::Pressed => {
+                    *bg_color = Color::srgb(0.06, 0.35, 0.75).into();
+                }
+                Interaction::Hovered => {
+                    *bg_color = Color::srgb(0.12, 0.55, 1.0).into();
+                }
+                Interaction::None => {
+                    *bg_color = Color::srgb(0.08, 0.45, 0.9).into();
+                }
+            },
+            ButtonType::Quit => match interaction {
+                Interaction::Pressed => {
+                    *bg_color = Color::srgb(0.55, 0.08, 0.08).into();
+                }
+                Interaction::Hovered => {
+                    *bg_color = Color::srgb(0.8, 0.15, 0.15).into();
+                }
+                Interaction::None => {
+                    *bg_color = Color::srgb(0.7, 0.1, 0.1).into();
+                }
+            },
         }
     }
 }
@@ -739,6 +1010,8 @@ fn update_ui_list(
     fonts: Res<AppFonts>,
     config: Res<LauncherConfig>,
     running: Res<RunningProcesses>,
+    active_tab: Res<ActiveTab>,
+    store_games: Res<StoreGames>,
     container_query: Query<Entity, With<ProjectListContainer>>,
     mut event_reader: EventReader<UpdateUiEvent>,
 ) {
@@ -760,218 +1033,408 @@ fn update_ui_list(
     let statuses = running.statuses.lock().unwrap();
 
     commands.entity(container_entity).with_children(|parent| {
-        if config.projects.is_empty() {
-            parent.spawn(Node {
-                width: Val::Percent(100.0),
-                height: Val::Px(160.0),
-                flex_direction: FlexDirection::Column,
-                align_items: AlignItems::Center,
-                justify_content: JustifyContent::Center,
-                row_gap: Val::Px(8.0),
-                ..default()
-            }).with_children(|ph| {
-                ph.spawn((
-                    Text::new("No Bevy games added to history yet."),
-                    TextFont {
-                        font: fonts.regular.clone(),
-                        font_size: 14.0,
+        match *active_tab {
+            ActiveTab::MyGames => {
+                if config.projects.is_empty() {
+                    parent.spawn(Node {
+                        width: Val::Percent(100.0),
+                        height: Val::Px(160.0),
+                        flex_direction: FlexDirection::Column,
+                        align_items: AlignItems::Center,
+                        justify_content: JustifyContent::Center,
+                        row_gap: Val::Px(8.0),
                         ..default()
-                    },
-                    TextColor(Color::srgba(0.6, 0.6, 0.7, 0.7)),
-                ));
-                ph.spawn((
-                    Text::new("Click 'Select Game Folder' to choose a Bevy folder to run."),
-                    TextFont {
-                        font: fonts.regular.clone(),
-                        font_size: 12.0,
-                        ..default()
-                    },
-                    TextColor(Color::srgba(0.5, 0.5, 0.6, 0.5)),
-                ));
-            });
-            return;
-        }
+                    }).with_children(|ph| {
+                        ph.spawn((
+                            Text::new("No Bevy games added to history yet."),
+                            TextFont {
+                                font: fonts.regular.clone(),
+                                font_size: 14.0,
+                                ..default()
+                            },
+                            TextColor(Color::srgba(0.6, 0.6, 0.7, 0.7)),
+                        ));
+                        ph.spawn((
+                            Text::new("Click 'Select Game Folder' to choose a Bevy folder to run."),
+                            TextFont {
+                                font: fonts.regular.clone(),
+                                font_size: 12.0,
+                                ..default()
+                            },
+                            TextColor(Color::srgba(0.5, 0.5, 0.6, 0.5)),
+                        ));
+                    });
+                    return;
+                }
 
-        // Show the 5 most recently used projects
-        let mut sorted_projects = config.projects.clone();
-        sorted_projects.sort_by(|a, b| b.last_launched.unwrap_or(0).cmp(&a.last_launched.unwrap_or(0)));
+                // Show the 5 most recently used projects
+                let mut sorted_projects = config.projects.clone();
+                sorted_projects.sort_by(|a, b| b.last_launched.unwrap_or(0).cmp(&a.last_launched.unwrap_or(0)));
 
-        for project in sorted_projects.iter().take(5) {
-            let status = statuses.get(&project.path).copied().unwrap_or(ProjectStatus::Idle);
-            let path_str = project.path.to_string_lossy().into_owned();
+                for project in sorted_projects.iter().take(5) {
+                    let status = statuses.get(&project.path).copied().unwrap_or(ProjectStatus::Idle);
+                    let path_str = project.path.to_string_lossy().into_owned();
 
-            parent.spawn((
-                Button, // Add Button so it has Interaction states
-                Node {
-                    width: Val::Percent(100.0),
-                    flex_direction: FlexDirection::Row,
-                    justify_content: JustifyContent::SpaceBetween,
-                    align_items: AlignItems::Center,
-                    padding: UiRect::all(Val::Px(14.0)),
-                    border: UiRect::all(Val::Px(1.0)),
-                    ..default()
-                },
-                BorderRadius::all(Val::Px(10.0)),
-                BackgroundColor(Color::srgba(0.08, 0.08, 0.12, 0.5)),
-                BorderColor(Color::srgba(0.2, 0.25, 0.35, 0.35)),
-                ProjectCard,
-            )).with_children(|card| {
-                // Info block
-                card.spawn(Node {
-                    flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(4.0),
-                    ..default()
-                }).with_children(|info| {
-                    info.spawn((
-                        Text::new(project.name.clone()),
-                        TextFont {
-                            font: fonts.semibold.clone(),
-                            font_size: 16.0,
-                            ..default()
-                        },
-                        TextColor(Color::WHITE),
-                    ));
-                    info.spawn((
-                        Text::new(path_str.clone()),
-                        TextFont {
-                            font: fonts.regular.clone(),
-                            font_size: 11.0,
-                            ..default()
-                        },
-                        TextColor(Color::srgba(0.5, 0.5, 0.6, 0.7)),
-                    ));
-                });
-
-                // Status & Actions block
-                card.spawn(Node {
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    column_gap: Val::Px(12.0),
-                    ..default()
-                }).with_children(|actions| {
-                    // Badge details
-                    let (badge_text, badge_color, badge_border_color, badge_text_color) = match status {
-                        ProjectStatus::Idle => (
-                            "Idle",
-                            Color::srgba(0.2, 0.2, 0.25, 0.2),
-                            Color::srgba(0.3, 0.35, 0.45, 0.4),
-                            Color::srgba(0.65, 0.65, 0.75, 0.75),
-                        ),
-                        ProjectStatus::Running => (
-                            "Running",
-                            Color::srgba(0.08, 0.6, 0.2, 0.12),
-                            Color::srgba(0.12, 0.65, 0.25, 0.4),
-                            Color::srgb(0.2, 0.85, 0.4),
-                        ),
-                        ProjectStatus::FailedLaunch => (
-                            "Failed",
-                            Color::srgba(0.75, 0.08, 0.08, 0.12),
-                            Color::srgba(0.8, 0.12, 0.12, 0.4),
-                            Color::srgb(0.95, 0.3, 0.3),
-                        ),
-                        ProjectStatus::Invalid => (
-                            "Invalid",
-                            Color::srgba(0.8, 0.4, 0.0, 0.12),
-                            Color::srgba(0.8, 0.45, 0.0, 0.4),
-                            Color::srgb(1.0, 0.6, 0.1),
-                        ),
-                    };
-
-                    // Badge node
-                    actions.spawn((
+                    parent.spawn((
+                        Button, // Add Button so it has Interaction states
                         Node {
-                            padding: UiRect::new(Val::Px(8.0), Val::Px(8.0), Val::Px(3.0), Val::Px(3.0)),
+                            width: Val::Percent(100.0),
+                            flex_direction: FlexDirection::Row,
+                            justify_content: JustifyContent::SpaceBetween,
+                            align_items: AlignItems::Center,
+                            padding: UiRect::all(Val::Px(14.0)),
                             border: UiRect::all(Val::Px(1.0)),
                             ..default()
                         },
-                        BorderRadius::all(Val::Px(4.0)),
-                        BackgroundColor(badge_color),
-                        BorderColor(badge_border_color),
-                    )).with_child((
-                        Text::new(badge_text),
+                        BorderRadius::all(Val::Px(10.0)),
+                        BackgroundColor(Color::srgba(0.08, 0.08, 0.12, 0.5)),
+                        BorderColor(Color::srgba(0.2, 0.25, 0.35, 0.35)),
+                        ProjectCard,
+                    )).with_children(|card| {
+                        // Info block
+                        card.spawn(Node {
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(4.0),
+                            ..default()
+                        }).with_children(|info| {
+                            info.spawn((
+                                Text::new(project.name.clone()),
+                                TextFont {
+                                    font: fonts.semibold.clone(),
+                                    font_size: 16.0,
+                                    ..default()
+                                },
+                                TextColor(Color::WHITE),
+                            ));
+                            info.spawn((
+                                Text::new(path_str.clone()),
+                                TextFont {
+                                    font: fonts.regular.clone(),
+                                    font_size: 11.0,
+                                    ..default()
+                                },
+                                TextColor(Color::srgba(0.5, 0.5, 0.6, 0.7)),
+                            ));
+                        });
+
+                        // Status & Actions block
+                        card.spawn(Node {
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            column_gap: Val::Px(12.0),
+                            ..default()
+                        }).with_children(|actions| {
+                            // Badge details
+                            let (badge_text, badge_color, badge_border_color, badge_text_color) = match status {
+                                ProjectStatus::Idle => (
+                                    "Idle",
+                                    Color::srgba(0.2, 0.2, 0.25, 0.2),
+                                    Color::srgba(0.3, 0.35, 0.45, 0.4),
+                                    Color::srgba(0.65, 0.65, 0.75, 0.75),
+                                ),
+                                ProjectStatus::Running => (
+                                    "Running",
+                                    Color::srgba(0.08, 0.6, 0.2, 0.12),
+                                    Color::srgba(0.12, 0.65, 0.25, 0.4),
+                                    Color::srgb(0.2, 0.85, 0.4),
+                                ),
+                                ProjectStatus::FailedLaunch => (
+                                    "Failed",
+                                    Color::srgba(0.75, 0.08, 0.08, 0.12),
+                                    Color::srgba(0.8, 0.12, 0.12, 0.4),
+                                    Color::srgb(0.95, 0.3, 0.3),
+                                ),
+                                ProjectStatus::Invalid => (
+                                    "Invalid",
+                                    Color::srgba(0.8, 0.4, 0.0, 0.12),
+                                    Color::srgba(0.8, 0.45, 0.0, 0.4),
+                                    Color::srgb(1.0, 0.6, 0.1),
+                                ),
+                            };
+
+                            // Badge node
+                            actions.spawn((
+                                Node {
+                                    padding: UiRect::new(Val::Px(8.0), Val::Px(8.0), Val::Px(3.0), Val::Px(3.0)),
+                                    border: UiRect::all(Val::Px(1.0)),
+                                    ..default()
+                                },
+                                BorderRadius::all(Val::Px(4.0)),
+                                BackgroundColor(badge_color),
+                                BorderColor(badge_border_color),
+                            )).with_child((
+                                Text::new(badge_text),
+                                TextFont {
+                                    font: fonts.regular.clone(),
+                                    font_size: 11.0,
+                                    ..default()
+                                },
+                                TextColor(badge_text_color),
+                            ));
+
+                            // Action buttons
+                            if status == ProjectStatus::Running {
+                                // Stop button
+                                actions.spawn((
+                                    Button,
+                                    Node {
+                                        padding: UiRect::new(Val::Px(12.0), Val::Px(12.0), Val::Px(6.0), Val::Px(6.0)),
+                                        justify_content: JustifyContent::Center,
+                                        align_items: AlignItems::Center,
+                                        ..default()
+                                    },
+                                    BorderRadius::all(Val::Px(6.0)),
+                                    BackgroundColor(Color::srgb(0.7, 0.1, 0.1)),
+                                    ButtonType::Stop,
+                                    ButtonAction::Stop(project.path.clone()),
+                                )).with_child((
+                                    Text::new("Stop"),
+                                    TextFont {
+                                        font: fonts.semibold.clone(),
+                                        font_size: 12.0,
+                                        ..default()
+                                    },
+                                    TextColor(Color::WHITE),
+                                ));
+                            } else {
+                                // Launch button
+                                actions.spawn((
+                                    Button,
+                                    Node {
+                                        padding: UiRect::new(Val::Px(12.0), Val::Px(12.0), Val::Px(6.0), Val::Px(6.0)),
+                                        justify_content: JustifyContent::Center,
+                                        align_items: AlignItems::Center,
+                                        ..default()
+                                    },
+                                    BorderRadius::all(Val::Px(6.0)),
+                                    BackgroundColor(Color::srgb(0.1, 0.6, 0.2)),
+                                    ButtonType::Launch,
+                                    ButtonAction::Launch(project.path.clone()),
+                                )).with_child((
+                                    Text::new("Launch"),
+                                    TextFont {
+                                        font: fonts.semibold.clone(),
+                                        font_size: 12.0,
+                                        ..default()
+                                    },
+                                    TextColor(Color::WHITE),
+                                ));
+                            }
+
+                            // Delete button
+                            actions.spawn((
+                                Button,
+                                Node {
+                                    padding: UiRect::new(Val::Px(10.0), Val::Px(10.0), Val::Px(6.0), Val::Px(6.0)),
+                                    border: UiRect::all(Val::Px(1.0)),
+                                    justify_content: JustifyContent::Center,
+                                    align_items: AlignItems::Center,
+                                    ..default()
+                                },
+                                BorderRadius::all(Val::Px(6.0)),
+                                BackgroundColor(Color::srgba(0.2, 0.2, 0.22, 0.8)),
+                                BorderColor(Color::srgba(0.3, 0.3, 0.3, 0.5)),
+                                ButtonType::Delete,
+                                ButtonAction::Delete(project.path.clone()),
+                            )).with_child((
+                                Text::new("X"),
+                                TextFont {
+                                    font: fonts.semibold.clone(),
+                                    font_size: 12.0,
+                                    ..default()
+                                },
+                                TextColor(Color::srgba(0.7, 0.7, 0.7, 0.8)),
+                            ));
+                        });
+                    });
+                }
+            }
+            ActiveTab::Store => {
+                if store_games.loading {
+                    parent.spawn(Node {
+                        width: Val::Percent(100.0),
+                        height: Val::Px(160.0),
+                        align_items: AlignItems::Center,
+                        justify_content: JustifyContent::Center,
+                        ..default()
+                    }).with_child((
+                        Text::new("Searching GitHub for Bevy games..."),
                         TextFont {
-                            font: fonts.regular.clone(),
-                            font_size: 11.0,
+                            font: fonts.semibold.clone(),
+                            font_size: 15.0,
                             ..default()
                         },
-                        TextColor(badge_text_color),
+                        TextColor(Color::srgba(0.6, 0.7, 0.9, 0.8)),
                     ));
+                    return;
+                }
 
-                    // Action buttons
-                    if status == ProjectStatus::Running {
-                        // Stop button
-                        actions.spawn((
-                            Button,
-                            Node {
-                                padding: UiRect::new(Val::Px(12.0), Val::Px(12.0), Val::Px(6.0), Val::Px(6.0)),
-                                justify_content: JustifyContent::Center,
-                                align_items: AlignItems::Center,
-                                ..default()
-                            },
-                            BorderRadius::all(Val::Px(6.0)),
-                            BackgroundColor(Color::srgb(0.7, 0.1, 0.1)),
-                            ButtonType::Stop,
-                            ButtonAction::Stop(project.path.clone()),
-                        )).with_child((
-                            Text::new("Stop"),
+                if let Some(ref err) = store_games.error {
+                    parent.spawn(Node {
+                        width: Val::Percent(100.0),
+                        height: Val::Px(160.0),
+                        flex_direction: FlexDirection::Column,
+                        align_items: AlignItems::Center,
+                        justify_content: JustifyContent::Center,
+                        row_gap: Val::Px(8.0),
+                        ..default()
+                    }).with_children(|ph| {
+                        ph.spawn((
+                            Text::new("Failed to connect to GitHub Store."),
                             TextFont {
                                 font: fonts.semibold.clone(),
+                                font_size: 15.0,
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.9, 0.3, 0.3)),
+                        ));
+                        ph.spawn((
+                            Text::new(err.clone()),
+                            TextFont {
+                                font: fonts.regular.clone(),
                                 font_size: 12.0,
                                 ..default()
                             },
-                            TextColor(Color::WHITE),
+                            TextColor(Color::srgba(0.7, 0.5, 0.5, 0.7)),
                         ));
-                    } else {
-                        // Launch button
-                        actions.spawn((
-                            Button,
-                            Node {
-                                padding: UiRect::new(Val::Px(12.0), Val::Px(12.0), Val::Px(6.0), Val::Px(6.0)),
-                                justify_content: JustifyContent::Center,
-                                align_items: AlignItems::Center,
-                                ..default()
-                            },
-                            BorderRadius::all(Val::Px(6.0)),
-                            BackgroundColor(Color::srgb(0.1, 0.6, 0.2)),
-                            ButtonType::Launch,
-                            ButtonAction::Launch(project.path.clone()),
-                        )).with_child((
-                            Text::new("Launch"),
-                            TextFont {
-                                font: fonts.semibold.clone(),
-                                font_size: 12.0,
-                                ..default()
-                            },
-                            TextColor(Color::WHITE),
-                        ));
-                    }
+                    });
+                    return;
+                }
 
-                    // Delete button
-                    actions.spawn((
+                if store_games.items.is_empty() {
+                    parent.spawn(Node {
+                        width: Val::Percent(100.0),
+                        height: Val::Px(160.0),
+                        align_items: AlignItems::Center,
+                        justify_content: JustifyContent::Center,
+                        ..default()
+                    }).with_child((
+                        Text::new("No Bevy games found on GitHub."),
+                        TextFont {
+                            font: fonts.regular.clone(),
+                            font_size: 14.0,
+                            ..default()
+                        },
+                        TextColor(Color::srgba(0.6, 0.6, 0.7, 0.7)),
+                    ));
+                    return;
+                }
+
+                // Show top 5 repositories from GitHub
+                for item in store_games.items.iter().take(5) {
+                    parent.spawn((
                         Button,
                         Node {
-                            padding: UiRect::new(Val::Px(10.0), Val::Px(10.0), Val::Px(6.0), Val::Px(6.0)),
-                            border: UiRect::all(Val::Px(1.0)),
-                            justify_content: JustifyContent::Center,
+                            width: Val::Percent(100.0),
+                            flex_direction: FlexDirection::Row,
+                            justify_content: JustifyContent::SpaceBetween,
                             align_items: AlignItems::Center,
+                            padding: UiRect::all(Val::Px(14.0)),
+                            border: UiRect::all(Val::Px(1.0)),
                             ..default()
                         },
-                        BorderRadius::all(Val::Px(6.0)),
-                        BackgroundColor(Color::srgba(0.2, 0.2, 0.22, 0.8)),
-                        BorderColor(Color::srgba(0.3, 0.3, 0.3, 0.5)),
-                        ButtonType::Delete,
-                        ButtonAction::Delete(project.path.clone()),
-                    )).with_child((
-                        Text::new("X"),
-                        TextFont {
-                            font: fonts.semibold.clone(),
-                            font_size: 12.0,
+                        BorderRadius::all(Val::Px(10.0)),
+                        BackgroundColor(Color::srgba(0.08, 0.08, 0.12, 0.5)),
+                        BorderColor(Color::srgba(0.2, 0.25, 0.35, 0.35)),
+                        ProjectCard,
+                    )).with_children(|card| {
+                        // Info Block
+                        card.spawn(Node {
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(4.0),
+                            width: Val::Percent(65.0),
                             ..default()
-                        },
-                        TextColor(Color::srgba(0.7, 0.7, 0.7, 0.8)),
-                    ));
-                });
-            });
+                        }).with_children(|info| {
+                            info.spawn(Node {
+                                flex_direction: FlexDirection::Row,
+                                column_gap: Val::Px(8.0),
+                                align_items: AlignItems::Center,
+                                ..default()
+                            }).with_children(|title_row| {
+                                title_row.spawn((
+                                    Text::new(item.name.clone()),
+                                    TextFont {
+                                        font: fonts.semibold.clone(),
+                                        font_size: 16.0,
+                                        ..default()
+                                    },
+                                    TextColor(Color::WHITE),
+                                ));
+                                title_row.spawn((
+                                    Text::new(format!("by {}", item.owner)),
+                                    TextFont {
+                                        font: fonts.regular.clone(),
+                                        font_size: 11.0,
+                                        ..default()
+                                    },
+                                    TextColor(Color::srgba(0.5, 0.5, 0.6, 0.8)),
+                                ));
+                            });
+
+                            info.spawn((
+                                Text::new(item.description.clone()),
+                                TextFont {
+                                    font: fonts.regular.clone(),
+                                    font_size: 11.0,
+                                    ..default()
+                                },
+                                TextColor(Color::srgba(0.5, 0.5, 0.6, 0.7)),
+                            ));
+                        });
+
+                        // Actions Block
+                        card.spawn(Node {
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            column_gap: Val::Px(12.0),
+                            ..default()
+                        }).with_children(|actions| {
+                            // Stars Badge
+                            actions.spawn((
+                                Node {
+                                    padding: UiRect::new(Val::Px(8.0), Val::Px(8.0), Val::Px(3.0), Val::Px(3.0)),
+                                    border: UiRect::all(Val::Px(1.0)),
+                                    ..default()
+                                },
+                                BorderRadius::all(Val::Px(4.0)),
+                                BackgroundColor(Color::srgba(0.9, 0.7, 0.1, 0.12)),
+                                BorderColor(Color::srgba(0.9, 0.7, 0.1, 0.4)),
+                            )).with_child((
+                                Text::new(format!("★ {}", item.stars)),
+                                TextFont {
+                                    font: fonts.semibold.clone(),
+                                    font_size: 11.0,
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(1.0, 0.75, 0.1)),
+                            ));
+
+                            // Open Link Button
+                            actions.spawn((
+                                Button,
+                                Node {
+                                    padding: UiRect::new(Val::Px(12.0), Val::Px(12.0), Val::Px(6.0), Val::Px(6.0)),
+                                    justify_content: JustifyContent::Center,
+                                    align_items: AlignItems::Center,
+                                    ..default()
+                                },
+                                BorderRadius::all(Val::Px(6.0)),
+                                BackgroundColor(Color::srgb(0.08, 0.45, 0.9)),
+                                ButtonType::OpenLink,
+                                ButtonAction::OpenUrl(item.url.clone()),
+                            )).with_child((
+                                Text::new("Open GitHub"),
+                                TextFont {
+                                    font: fonts.semibold.clone(),
+                                    font_size: 12.0,
+                                    ..default()
+                                },
+                                TextColor(Color::WHITE),
+                            ));
+                        });
+                    });
+                }
+            }
         }
     });
 }
@@ -1013,3 +1476,44 @@ fn animate_background(
         }
     }
 }
+
+fn process_store_returns(
+    store_channel: Res<StoreChannel>,
+    mut store_games: ResMut<StoreGames>,
+    mut ui_events: EventWriter<UpdateUiEvent>,
+) {
+    let rx = store_channel.rx.lock().unwrap();
+    if let Ok(result) = rx.try_recv() {
+        store_games.loading = false;
+        match result {
+            Ok(items) => {
+                store_games.items = items;
+                store_games.error = None;
+            }
+            Err(e) => {
+                store_games.error = Some(e);
+            }
+        }
+        ui_events.send(UpdateUiEvent);
+    }
+}
+
+fn update_tab_buttons(
+    active_tab: Res<ActiveTab>,
+    mut query: Query<(&mut BackgroundColor, &mut BorderColor, &ButtonAction)>,
+) {
+    if active_tab.is_changed() {
+        for (mut bg_color, mut border_color, action) in &mut query {
+            if let ButtonAction::SwitchTab(tab) = action {
+                if *tab == *active_tab {
+                    *bg_color = Color::srgb(0.08, 0.45, 0.9).into();
+                    *border_color = Color::srgb(0.0, 0.8, 1.0).into();
+                } else {
+                    *bg_color = Color::srgba(0.12, 0.12, 0.15, 0.6).into();
+                    *border_color = Color::srgba(0.2, 0.25, 0.35, 0.35).into();
+                }
+            }
+        }
+    }
+}
+
