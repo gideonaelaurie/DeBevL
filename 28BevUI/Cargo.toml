@@ -1,0 +1,15 @@
+[package]
+name = "bevui-28"
+version = "0.1.0"
+edition = "2024"
+description = "A custom glassmorphic Bevy UI game launcher plugin"
+license = "MIT"
+
+[dependencies]
+bevy = "0.15"
+rfd = "0.15"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rand = "0.9"
+ureq = { version = "2.10", features = ["json"] }
+webbrowser = "1.0"

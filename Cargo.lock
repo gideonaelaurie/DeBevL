@@ -432,6 +432,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bevui-28"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "rand 0.9.4",
+ "rfd",
+ "serde",
+ "serde_json",
+ "ureq",
+ "webbrowser",
+]
+
+[[package]]
 name = "bevy"
 version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1914,13 +1927,9 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 name = "debevl"
 version = "0.1.0"
 dependencies = [
+ "bevui-28",
  "bevy",
  "rand 0.9.4",
- "rfd",
- "serde",
- "serde_json",
- "ureq",
- "webbrowser",
 ]
 
 [[package]]

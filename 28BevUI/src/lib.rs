@@ -1,18 +1,351 @@
 use bevy::prelude::*;
 use bevy::app::AppExit;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use std::fs::{create_dir_all, File};
 use std::io::{Read, Write};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    AppFonts, DialogChannel, RunningProcesses, StoreGames, StoreChannel,
-    ActiveDownloads, DownloadChannel, ProjectStatus, DownloadResult,
-    get_game_download_path,
-};
-use crate::config::{save_config, LauncherConfig, Project};
-use crate::launcher::{detect_project_type, launch_project, ProjectType};
+use std::collections::HashMap;
+use std::sync::mpsc::{Sender, Receiver};
+use std::sync::Mutex;
+
+// ==========================================
+// Config (originally config.rs)
+// ==========================================
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct Project {
+    pub name: String,
+    pub path: PathBuf,
+    pub last_launched: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, Resource)]
+pub struct LauncherConfig {
+    pub projects: Vec<Project>,
+}
+
+pub fn get_config_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let mut path = PathBuf::from(home);
+    path.push(".debevl");
+    path.push("config");
+    Some(path)
+}
+
+pub fn load_config() -> LauncherConfig {
+    let Some(mut path) = get_config_path() else {
+        return LauncherConfig::default();
+    };
+    path.push("projects.json");
+
+    if !path.exists() {
+        return LauncherConfig::default();
+    }
+
+    let mut file = match File::open(&path) {
+        Ok(f) => f,
+        Err(_) => return LauncherConfig::default(),
+    };
+
+    let mut contents = String::new();
+    if file.read_to_string(&mut contents).is_err() {
+        return LauncherConfig::default();
+    }
+
+    serde_json::from_str(&contents).unwrap_or_default()
+}
+
+pub fn save_config(config: &LauncherConfig) {
+    let Some(dir_path) = get_config_path() else {
+        return;
+    };
+
+    if !dir_path.exists() && create_dir_all(&dir_path).is_err() {
+        return;
+    }
+
+    let mut path = dir_path.clone();
+    path.push("projects.json");
+
+    let Ok(serialized) = serde_json::to_string_pretty(config) else {
+        return;
+    };
+
+    if let Ok(mut file) = File::create(&path) {
+        let _ = file.write_all(serialized.as_bytes());
+    }
+}
+
+// ==========================================
+// Launcher (originally launcher.rs)
+// ==========================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectType {
+    Cargo,
+    Executable(PathBuf),
+    Invalid,
+}
+
+pub fn detect_project_type(path: &Path) -> ProjectType {
+    if !path.exists() || !path.is_dir() {
+        return ProjectType::Invalid;
+    }
+
+    if path.join("Cargo.toml").exists() {
+        return ProjectType::Cargo;
+    }
+
+    // Look for executable files in the root folder
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(metadata) = p.metadata() {
+                        if metadata.permissions().mode() & 0o111 != 0 {
+                            // Avoid files that are scripts or config
+                            if let Some(ext) = p.extension() {
+                                let ext_str = ext.to_string_lossy().to_lowercase();
+                                if ext_str == "sh"
+                                    || ext_str == "json"
+                                    || ext_str == "toml"
+                                    || ext_str == "txt"
+                                    || ext_str == "md"
+                                    || ext_str == "py"
+                                {
+                                    continue;
+                                }
+                            }
+                            return ProjectType::Executable(p);
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    if let Some(ext) = p.extension() {
+                        if ext.to_string_lossy().to_lowercase() == "exe" {
+                            return ProjectType::Executable(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ProjectType::Invalid
+}
+
+pub fn launch_project(path: &Path) -> Result<std::process::Child, String> {
+    match detect_project_type(path) {
+        ProjectType::Cargo => std::process::Command::new("cargo")
+            .args(["run", "--release"])
+            .current_dir(path)
+            .spawn()
+            .map_err(|e| format!("Failed to spawn cargo run: {}", e)),
+        ProjectType::Executable(exe_path) => std::process::Command::new(&exe_path)
+            .current_dir(path)
+            .spawn()
+            .map_err(|e| format!("Failed to spawn executable ({}): {}", exe_path.display(), e)),
+        ProjectType::Invalid => Err("No valid Cargo.toml or executable found in this folder. Please verify this is a Bevy game folder.".to_string()),
+    }
+}
+
+// ==========================================
+// Additional Types & Channels
+// ==========================================
+
+#[derive(Resource)]
+pub struct AppFonts {
+    pub regular: Handle<Font>,
+    pub semibold: Handle<Font>,
+}
+
+#[derive(Resource)]
+pub struct DialogChannel {
+    pub tx: Sender<PathBuf>,
+    pub rx: Mutex<Receiver<PathBuf>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectStatus {
+    Idle,
+    Running,
+    FailedLaunch,
+    Invalid,
+}
+
+#[derive(Resource, Default)]
+pub struct RunningProcesses {
+    pub map: Mutex<HashMap<PathBuf, std::process::Child>>,
+    pub statuses: Mutex<HashMap<PathBuf, ProjectStatus>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoreGameItem {
+    pub name: String,
+    pub owner: String,
+    pub description: String,
+    pub stars: u32,
+    pub url: String,
+}
+
+#[derive(Resource, Default)]
+pub struct StoreGames {
+    pub items: Vec<StoreGameItem>,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Resource)]
+pub struct StoreChannel {
+    pub rx: Mutex<Receiver<Result<Vec<StoreGameItem>, String>>>,
+}
+
+pub struct DownloadResult {
+    pub name: String,
+    pub path: PathBuf,
+    pub result: Result<(), String>,
+}
+
+#[derive(Resource)]
+pub struct DownloadChannel {
+    pub tx: Sender<DownloadResult>,
+    pub rx: Mutex<Receiver<DownloadResult>>,
+}
+
+#[derive(Resource, Default)]
+pub struct ActiveDownloads {
+    pub names: std::collections::HashSet<String>,
+}
+
+pub fn get_game_download_path(game_name: &str) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let mut path = PathBuf::from(home);
+    path.push(".debevl");
+    path.push("apps");
+    path.push("games");
+    path.push(game_name);
+    Some(path)
+}
+
+// ==========================================
+// GitHub Store Fetching
+// ==========================================
+
+#[derive(Debug, Clone, Deserialize)]
+struct GithubOwner {
+    login: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GithubRepoItem {
+    name: String,
+    html_url: String,
+    description: Option<String>,
+    stargazers_count: u32,
+    owner: GithubOwner,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GithubSearchResponse {
+    items: Vec<GithubRepoItem>,
+}
+
+pub fn fetch_store_games(tx: Sender<Result<Vec<StoreGameItem>, String>>) {
+    std::thread::spawn(move || {
+        let url = "https://api.github.com/search/repositories?q=topic:bevy+topic:game&sort=stars&order=desc";
+        let request = ureq::get(url).set("User-Agent", "DeBevL-Game-Launcher");
+        
+        match request.call() {
+            Ok(response) => {
+                match response.into_json::<GithubSearchResponse>() {
+                    Ok(search_res) => {
+                        let mut items = Vec::new();
+                        // Query the top 5 Bevy games
+                        for item in search_res.items.into_iter().take(5) {
+                            let owner = item.owner.login.clone();
+                            let repo_name = item.name.clone();
+                            let readme_url = format!("https://api.github.com/repos/{}/{}/readme", owner, repo_name);
+                            
+                            // Fallback to repository description if README is missing or rate-limited
+                            let mut description = item.description.clone().unwrap_or_default();
+                            
+                            if let Ok(readme_resp) = ureq::get(&readme_url)
+                                .set("User-Agent", "DeBevL-Game-Launcher")
+                                .set("Accept", "application/vnd.github.raw")
+                                .call()
+                            {
+                                if let Ok(readme_text) = readme_resp.into_string() {
+                                    let cleaned = clean_readme(&readme_text);
+                                    if !cleaned.is_empty() {
+                                        description = cleaned;
+                                    }
+                                }
+                            }
+                            
+                            if description.is_empty() {
+                                description = "No description provided.".to_string();
+                            }
+
+                            items.push(StoreGameItem {
+                                name: repo_name,
+                                owner,
+                                description,
+                                stars: item.stargazers_count,
+                                url: item.html_url,
+                            });
+                        }
+                        let _ = tx.send(Ok(items));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("JSON Parse Error: {}", e)));
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(Err(format!("Network Error: {}", e)));
+            }
+        }
+    });
+}
+
+pub fn clean_readme(readme: &str) -> String {
+    let mut clean: String = readme
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| {
+            !line.is_empty()
+                && !line.starts_with('#')
+                && !line.starts_with('[')
+                && !line.starts_with('<')
+                && !line.starts_with('!')
+                && !line.starts_with("```")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if clean.len() > 180 {
+        clean.truncate(177);
+        clean.push_str("...");
+    }
+
+    clean
+}
+
+pub fn setup_fonts(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
+    let regular_bytes = include_bytes!("../../assets/Roboto-Regular.ttf");
+    let semibold_bytes = include_bytes!("../../assets/Roboto-Medium.ttf");
+
+    let regular = fonts.add(Font::try_from_bytes(regular_bytes.to_vec()).unwrap());
+    let semibold = fonts.add(Font::try_from_bytes(semibold_bytes.to_vec()).unwrap());
+
+    commands.insert_resource(AppFonts { regular, semibold });
+}
 
 #[derive(Event)]
 pub struct UpdateUiEvent;
@@ -126,7 +459,23 @@ impl Plugin for _28bevUI {
     fn build(&self, app: &mut App) {
         let ui_config = load_ui_config();
 
+        // Create channel for the file dialog
+        let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+
+        // Create channel for GitHub store
+        let (store_tx, store_rx) = std::sync::mpsc::channel::<Result<Vec<StoreGameItem>, String>>();
+        fetch_store_games(store_tx);
+
+        // Create channel for game downloads
+        let (download_tx, download_rx) = std::sync::mpsc::channel::<DownloadResult>();
+
         app.insert_resource(ui_config.active_tab)
+            .insert_resource(DialogChannel { tx, rx: Mutex::new(rx) })
+            .insert_resource(DownloadChannel { tx: download_tx, rx: Mutex::new(download_rx) })
+            .insert_resource(ActiveDownloads::default())
+            .insert_resource(StoreGames { loading: true, ..default() })
+            .insert_resource(StoreChannel { rx: Mutex::new(store_rx) })
+            .insert_resource(RunningProcesses::default())
             .add_event::<UpdateUiEvent>()
             .add_systems(Update, (
                 process_dialog_returns,

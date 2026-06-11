@@ -1,19 +1,12 @@
 use bevy::prelude::*;
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Mutex;
 use std::time::SystemTime;
 
-mod config;
-mod launcher;
-mod ui_28bevui;
-
-use config::{load_config, save_config, LauncherConfig, Project};
-use launcher::{detect_project_type, launch_project, ProjectType};
-use ui_28bevui::{_28bevUI, UpdateUiEvent};
-
-use serde::Deserialize;
+use bevui_28::{
+    _28bevUI, setup_fonts, setup_ui, LauncherConfig, Project, RunningProcesses, ProjectStatus,
+    ProjectType, detect_project_type, launch_project, load_config, save_config,
+    UpdateUiEvent,
+};
 
 #[derive(Component)]
 struct RotatingObject {
@@ -24,100 +17,6 @@ struct RotatingObject {
 #[derive(Component)]
 struct Particle {
     velocity: Vec3,
-}
-
-// Resources
-#[derive(Resource)]
-struct AppFonts {
-    regular: Handle<Font>,
-    semibold: Handle<Font>,
-}
-
-#[derive(Resource)]
-struct DialogChannel {
-    tx: Sender<PathBuf>,
-    rx: Mutex<Receiver<PathBuf>>,
-}
-
-#[derive(Resource, Default)]
-struct RunningProcesses {
-    map: Mutex<HashMap<PathBuf, std::process::Child>>,
-    statuses: Mutex<HashMap<PathBuf, ProjectStatus>>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProjectStatus {
-    Idle,
-    Running,
-    FailedLaunch,
-    Invalid,
-}
-
-#[derive(Debug, Clone)]
-struct StoreGameItem {
-    name: String,
-    owner: String,
-    description: String,
-    stars: u32,
-    url: String,
-}
-
-#[derive(Resource, Default)]
-struct StoreGames {
-    items: Vec<StoreGameItem>,
-    loading: bool,
-    error: Option<String>,
-}
-
-#[derive(Resource)]
-struct StoreChannel {
-    rx: Mutex<Receiver<Result<Vec<StoreGameItem>, String>>>,
-}
-
-struct DownloadResult {
-    name: String,
-    path: PathBuf,
-    result: Result<(), String>,
-}
-
-#[derive(Resource)]
-struct DownloadChannel {
-    tx: Sender<DownloadResult>,
-    rx: Mutex<Receiver<DownloadResult>>,
-}
-
-#[derive(Resource, Default)]
-struct ActiveDownloads {
-    names: std::collections::HashSet<String>,
-}
-
-fn get_game_download_path(game_name: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let mut path = PathBuf::from(home);
-    path.push(".debevl");
-    path.push("apps");
-    path.push("games");
-    path.push(game_name);
-    Some(path)
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GithubOwner {
-    login: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GithubRepoItem {
-    name: String,
-    html_url: String,
-    description: Option<String>,
-    stargazers_count: u32,
-    owner: GithubOwner,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GithubSearchResponse {
-    items: Vec<GithubRepoItem>,
 }
 
 #[derive(Resource)]
@@ -141,16 +40,6 @@ fn main() {
     // Load initial configuration
     let config = load_config();
 
-    // Create channel for the file dialog
-    let (tx, rx) = channel::<PathBuf>();
-
-    // Create channel for GitHub store
-    let (store_tx, store_rx) = channel::<Result<Vec<StoreGameItem>, String>>();
-    fetch_store_games(store_tx);
-
-    // Create channel for game downloads
-    let (download_tx, download_rx) = channel::<DownloadResult>();
-
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -163,16 +52,10 @@ fn main() {
         .add_plugins(_28bevUI)
         .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.04)))
         .insert_resource(config)
-        .insert_resource(DialogChannel { tx, rx: Mutex::new(rx) })
-        .insert_resource(DownloadChannel { tx: download_tx, rx: Mutex::new(download_rx) })
-        .insert_resource(ActiveDownloads::default())
-        .insert_resource(StoreGames { loading: true, ..default() })
-        .insert_resource(StoreChannel { rx: Mutex::new(store_rx) })
-        .insert_resource(RunningProcesses::default())
         .insert_resource(InitialPath(initial_path))
         .add_systems(Startup, (
             setup_fonts,
-            ui_28bevui::setup_ui,
+            setup_ui,
             setup_3d_background,
             init_launcher,
             initial_launch_system,
@@ -182,99 +65,6 @@ fn main() {
             animate_background,
         ))
         .run();
-}
-
-fn fetch_store_games(tx: Sender<Result<Vec<StoreGameItem>, String>>) {
-    std::thread::spawn(move || {
-        let url = "https://api.github.com/search/repositories?q=topic:bevy+topic:game&sort=stars&order=desc";
-        let request = ureq::get(url).set("User-Agent", "DeBevL-Game-Launcher");
-        
-        match request.call() {
-            Ok(response) => {
-                match response.into_json::<GithubSearchResponse>() {
-                    Ok(search_res) => {
-                        let mut items = Vec::new();
-                        // Query the top 5 Bevy games
-                        for item in search_res.items.into_iter().take(5) {
-                            let owner = item.owner.login.clone();
-                            let repo_name = item.name.clone();
-                            let readme_url = format!("https://api.github.com/repos/{}/{}/readme", owner, repo_name);
-                            
-                            // Fallback to repository description if README is missing or rate-limited
-                            let mut description = item.description.clone().unwrap_or_default();
-                            
-                            if let Ok(readme_resp) = ureq::get(&readme_url)
-                                .set("User-Agent", "DeBevL-Game-Launcher")
-                                .set("Accept", "application/vnd.github.raw")
-                                .call()
-                            {
-                                if let Ok(readme_text) = readme_resp.into_string() {
-                                    let cleaned = clean_readme(&readme_text);
-                                    if !cleaned.is_empty() {
-                                        description = cleaned;
-                                    }
-                                }
-                            }
-                            
-                            if description.is_empty() {
-                                description = "No description provided.".to_string();
-                            }
-
-                            items.push(StoreGameItem {
-                                name: repo_name,
-                                owner,
-                                description,
-                                stars: item.stargazers_count,
-                                url: item.html_url,
-                            });
-                        }
-                        let _ = tx.send(Ok(items));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(format!("JSON Parse Error: {}", e)));
-                    }
-                }
-            }
-            Err(e) => {
-                let _ = tx.send(Err(format!("Network Error: {}", e)));
-            }
-        }
-    });
-}
-
-fn clean_readme(readme: &str) -> String {
-    let mut clean: String = readme
-        .lines()
-        .map(|line| line.trim())
-        // Filter out empty lines, markdown headers, links, badges, images, and code blocks
-        .filter(|line| {
-            !line.is_empty()
-                && !line.starts_with('#')
-                && !line.starts_with('[')
-                && !line.starts_with('<')
-                && !line.starts_with('!')
-                && !line.starts_with("```")
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    if clean.len() > 180 {
-        clean.truncate(177);
-        clean.push_str("...");
-    }
-
-    clean
-}
-
-// Startup systems
-fn setup_fonts(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
-    let regular_bytes = include_bytes!("../assets/Roboto-Regular.ttf");
-    let semibold_bytes = include_bytes!("../assets/Roboto-Medium.ttf");
-
-    let regular = fonts.add(Font::try_from_bytes(regular_bytes.to_vec()).unwrap());
-    let semibold = fonts.add(Font::try_from_bytes(semibold_bytes.to_vec()).unwrap());
-
-    commands.insert_resource(AppFonts { regular, semibold });
 }
 
 fn setup_3d_background(
@@ -383,8 +173,6 @@ fn setup_3d_background(
     }
 }
 
-// UI setup has been moved to ui_28 plugin
-
 // System to initialize status map
 fn init_launcher(
     config: Res<LauncherConfig>,
@@ -467,8 +255,6 @@ fn initial_launch_system(
     }
 }
 
-
-
 // System to monitor background processes
 fn monitor_processes(
     running: Res<RunningProcesses>,
@@ -508,8 +294,6 @@ fn monitor_processes(
     }
 }
 
-// Systems handle_ui_buttons, button_system, card_hover_system, and update_ui_list have been moved to ui_28 plugin
-
 // Background animation system
 fn animate_background(
     time: Res<Time>,
@@ -547,6 +331,3 @@ fn animate_background(
         }
     }
 }
-
-// Systems process_store_returns, update_tab_buttons, and process_download_returns have been moved to ui_28 plugin
-
