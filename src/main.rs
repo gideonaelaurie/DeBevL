@@ -104,8 +104,7 @@ fn main() {
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "DeBevL - Bevy Game Launcher".to_string(),
-                resolution: (800.0, 600.0).into(),
-                resizable: false,
+                mode: bevy::window::WindowMode::BorderlessFullscreen(bevy::window::MonitorSelection::Current),
                 ..default()
             }),
             ..default()
