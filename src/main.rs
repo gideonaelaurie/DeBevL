@@ -259,6 +259,7 @@ fn initial_launch_system(
 fn monitor_processes(
     running: Res<RunningProcesses>,
     mut ui_events: EventWriter<UpdateUiEvent>,
+    mut window_query: Query<&mut Window, With<bevy::window::PrimaryWindow>>,
 ) {
     let mut map = running.map.lock().unwrap();
     let mut statuses = running.statuses.lock().unwrap();
@@ -288,6 +289,14 @@ fn monitor_processes(
             }
         }
     });
+
+    if let Ok(mut window) = window_query.get_single_mut() {
+        let is_any_running = !map.is_empty();
+        let target_visible = !is_any_running;
+        if window.visible != target_visible {
+            window.visible = target_visible;
+        }
+    }
 
     if changed {
         ui_events.send(UpdateUiEvent);

@@ -1331,7 +1331,7 @@ pub fn update_ui_list(
                                     BorderRadius::all(Val::Px(6.0)),
                                     BackgroundColor(Color::srgba(0.2, 0.2, 0.25, 0.4)),
                                 )).with_child((
-                                    Text::new("Downloading..."),
+                                    Text::new("Installing..."),
                                     TextFont {
                                         font: fonts.semibold.clone(),
                                         font_size: 12.0,
@@ -1496,6 +1496,19 @@ pub fn handle_ui_buttons(
 
                             if !status.success() {
                                 return Err(format!("git clone failed with exit status: {:?}", status.code()));
+                            }
+
+                            // If it's a Cargo project, compile it right away
+                            if dest_path.join("Cargo.toml").exists() {
+                                let build_status = std::process::Command::new("cargo")
+                                    .args(["build", "--release"])
+                                    .current_dir(&dest_path)
+                                    .status()
+                                    .map_err(|e| format!("Failed to execute cargo build: {}", e))?;
+
+                                if !build_status.success() {
+                                    return Err(format!("cargo build failed with exit status: {:?}", build_status.code()));
+                                }
                             }
 
                             Ok(dest_path)

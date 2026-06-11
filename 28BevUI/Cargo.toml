@@ -1,6 +1,6 @@
 [package]
 name = "bevui-28"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A custom glassmorphic Bevy UI game launcher plugin"
 license = "MIT"
