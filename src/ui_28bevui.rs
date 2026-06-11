@@ -71,7 +71,7 @@ pub fn get_ui_config_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     let mut path = PathBuf::from(home);
     path.push(".debevl");
-    path.push("28ui");
+    path.push("28bevUI");
     Some(path)
 }
 
@@ -120,9 +120,9 @@ pub fn save_ui_config(config: &UiConfig) {
 }
 
 #[allow(non_camel_case_types)]
-pub struct _28ui;
+pub struct _28bevUI;
 
-impl Plugin for _28ui {
+impl Plugin for _28bevUI {
     fn build(&self, app: &mut App) {
         let ui_config = load_ui_config();
 

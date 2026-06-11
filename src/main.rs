@@ -7,11 +7,11 @@ use std::time::SystemTime;
 
 mod config;
 mod launcher;
-mod ui_28;
+mod ui_28bevui;
 
 use config::{load_config, save_config, LauncherConfig, Project};
 use launcher::{detect_project_type, launch_project, ProjectType};
-use ui_28::{_28ui, UpdateUiEvent};
+use ui_28bevui::{_28bevUI, UpdateUiEvent};
 
 use serde::Deserialize;
 
@@ -160,7 +160,7 @@ fn main() {
             }),
             ..default()
         }))
-        .add_plugins(_28ui)
+        .add_plugins(_28bevUI)
         .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.04)))
         .insert_resource(config)
         .insert_resource(DialogChannel { tx, rx: Mutex::new(rx) })
@@ -172,7 +172,7 @@ fn main() {
         .insert_resource(InitialPath(initial_path))
         .add_systems(Startup, (
             setup_fonts,
-            ui_28::setup_ui,
+            ui_28bevui::setup_ui,
             setup_3d_background,
             init_launcher,
             initial_launch_system,
