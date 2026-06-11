@@ -41,6 +41,7 @@ enum ButtonType {
     Tab(ActiveTab),
     OpenLink,
     Quit,
+    Download,
 }
 
 #[derive(Component, Clone)]
@@ -52,6 +53,7 @@ enum ButtonAction {
     SwitchTab(ActiveTab),
     OpenUrl(String),
     Quit,
+    Download { name: String, url: String },
 }
 
 #[derive(Component)]
@@ -113,6 +115,33 @@ struct StoreChannel {
     rx: Mutex<Receiver<Result<Vec<StoreGameItem>, String>>>,
 }
 
+struct DownloadResult {
+    name: String,
+    path: PathBuf,
+    result: Result<(), String>,
+}
+
+#[derive(Resource)]
+struct DownloadChannel {
+    tx: Sender<DownloadResult>,
+    rx: Mutex<Receiver<DownloadResult>>,
+}
+
+#[derive(Resource, Default)]
+struct ActiveDownloads {
+    names: std::collections::HashSet<String>,
+}
+
+fn get_game_download_path(game_name: &str) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let mut path = PathBuf::from(home);
+    path.push(".debevl");
+    path.push("apps");
+    path.push("games");
+    path.push(game_name);
+    Some(path)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct GithubOwner {
     login: String,
@@ -160,6 +189,9 @@ fn main() {
     let (store_tx, store_rx) = channel::<Result<Vec<StoreGameItem>, String>>();
     fetch_store_games(store_tx);
 
+    // Create channel for game downloads
+    let (download_tx, download_rx) = channel::<DownloadResult>();
+
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -172,6 +204,8 @@ fn main() {
         .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.04)))
         .insert_resource(config)
         .insert_resource(DialogChannel { tx, rx: Mutex::new(rx) })
+        .insert_resource(DownloadChannel { tx: download_tx, rx: Mutex::new(download_rx) })
+        .insert_resource(ActiveDownloads::default())
         .insert_resource(ActiveTab::default())
         .insert_resource(StoreGames { loading: true, ..default() })
         .insert_resource(StoreChannel { rx: Mutex::new(store_rx) })
@@ -188,6 +222,7 @@ fn main() {
         .add_systems(Update, (
             process_dialog_returns,
             process_store_returns,
+            process_download_returns,
             monitor_processes,
             handle_ui_buttons,
             button_system,
@@ -806,6 +841,8 @@ fn handle_ui_buttons(
     mut config: ResMut<LauncherConfig>,
     running: Res<RunningProcesses>,
     dialog_channel: Res<DialogChannel>,
+    download_channel: Res<DownloadChannel>,
+    mut active_downloads: ResMut<ActiveDownloads>,
     mut ui_events: EventWriter<UpdateUiEvent>,
     mut active_tab: ResMut<ActiveTab>,
     mut app_exit: EventWriter<AppExit>,
@@ -880,6 +917,66 @@ fn handle_ui_buttons(
                 }
                 ButtonAction::Quit => {
                     app_exit.send(AppExit::Success);
+                }
+                ButtonAction::Download { name, url } => {
+                    if active_downloads.names.contains(name) {
+                        continue;
+                    }
+                    active_downloads.names.insert(name.clone());
+
+                    let tx = download_channel.tx.clone();
+                    let name_clone = name.clone();
+                    let url_clone = url.clone();
+
+                    std::thread::spawn(move || {
+                        let result = (|| {
+                            let dest_path = get_game_download_path(&name_clone)
+                                .ok_or_else(|| "Could not determine home directory".to_string())?;
+
+                            // Ensure parent directory exists
+                            if let Some(parent) = dest_path.parent() {
+                                std::fs::create_dir_all(parent)
+                                    .map_err(|e| format!("Failed to create parent directory: {}", e))?;
+                            }
+
+                            // Remove existing directory if any
+                            if dest_path.exists() {
+                                std::fs::remove_dir_all(&dest_path)
+                                    .map_err(|e| format!("Failed to clear existing folder: {}", e))?;
+                            }
+
+                            // Run git clone
+                            let status = std::process::Command::new("git")
+                                .args(["clone", &url_clone, dest_path.to_str().ok_or("Invalid path string")?])
+                                .status()
+                                .map_err(|e| format!("Failed to execute git clone: {}", e))?;
+
+                            if !status.success() {
+                                return Err(format!("git clone failed with exit status: {:?}", status.code()));
+                            }
+
+                            Ok(dest_path)
+                        })();
+
+                        match result {
+                            Ok(path) => {
+                                let _ = tx.send(DownloadResult {
+                                    name: name_clone,
+                                    path,
+                                    result: Ok(()),
+                                });
+                            }
+                            Err(e) => {
+                                let _ = tx.send(DownloadResult {
+                                    name: name_clone,
+                                    path: PathBuf::new(),
+                                    result: Err(e),
+                                });
+                            }
+                        }
+                    });
+
+                    ui_events.send(UpdateUiEvent);
                 }
             }
         }
@@ -981,6 +1078,17 @@ fn button_system(
                     *bg_color = Color::srgb(0.7, 0.1, 0.1).into();
                 }
             },
+            ButtonType::Download => match interaction {
+                Interaction::Pressed => {
+                    *bg_color = Color::srgb(0.08, 0.5, 0.15).into();
+                }
+                Interaction::Hovered => {
+                    *bg_color = Color::srgb(0.15, 0.7, 0.25).into();
+                }
+                Interaction::None => {
+                    *bg_color = Color::srgb(0.1, 0.6, 0.2).into();
+                }
+            },
         }
     }
 }
@@ -1012,6 +1120,7 @@ fn update_ui_list(
     running: Res<RunningProcesses>,
     active_tab: Res<ActiveTab>,
     store_games: Res<StoreGames>,
+    active_downloads: Res<ActiveDownloads>,
     container_query: Query<Entity, With<ProjectListContainer>>,
     mut event_reader: EventReader<UpdateUiEvent>,
 ) {
@@ -1409,7 +1518,7 @@ fn update_ui_list(
                                 TextColor(Color::srgb(1.0, 0.75, 0.1)),
                             ));
 
-                            // Open Link Button
+                                                        // Open Link Button
                             actions.spawn((
                                 Button,
                                 Node {
@@ -1431,6 +1540,76 @@ fn update_ui_list(
                                 },
                                 TextColor(Color::WHITE),
                             ));
+
+                            // Download/Status Button
+                            let download_path = get_game_download_path(&item.name);
+                            let is_downloaded = download_path.as_ref().map(|p| p.exists()).unwrap_or(false);
+                            let is_downloading = active_downloads.names.contains(&item.name);
+
+                            if is_downloaded {
+                                actions.spawn((
+                                    Node {
+                                        padding: UiRect::new(Val::Px(12.0), Val::Px(12.0), Val::Px(6.0), Val::Px(6.0)),
+                                        justify_content: JustifyContent::Center,
+                                        align_items: AlignItems::Center,
+                                        ..default()
+                                    },
+                                    BorderRadius::all(Val::Px(6.0)),
+                                    BackgroundColor(Color::srgba(0.2, 0.2, 0.25, 0.4)),
+                                )).with_child((
+                                    Text::new("In Library"),
+                                    TextFont {
+                                        font: fonts.semibold.clone(),
+                                        font_size: 12.0,
+                                        ..default()
+                                    },
+                                    TextColor(Color::srgba(0.6, 0.6, 0.7, 0.5)),
+                                ));
+                            } else if is_downloading {
+                                actions.spawn((
+                                    Node {
+                                        padding: UiRect::new(Val::Px(12.0), Val::Px(12.0), Val::Px(6.0), Val::Px(6.0)),
+                                        justify_content: JustifyContent::Center,
+                                        align_items: AlignItems::Center,
+                                        ..default()
+                                    },
+                                    BorderRadius::all(Val::Px(6.0)),
+                                    BackgroundColor(Color::srgba(0.2, 0.2, 0.25, 0.4)),
+                                )).with_child((
+                                    Text::new("Downloading..."),
+                                    TextFont {
+                                        font: fonts.semibold.clone(),
+                                        font_size: 12.0,
+                                        ..default()
+                                    },
+                                    TextColor(Color::srgba(0.6, 0.6, 0.7, 0.5)),
+                                ));
+                            } else {
+                                actions.spawn((
+                                    Button,
+                                    Node {
+                                        padding: UiRect::new(Val::Px(12.0), Val::Px(12.0), Val::Px(6.0), Val::Px(6.0)),
+                                        justify_content: JustifyContent::Center,
+                                        align_items: AlignItems::Center,
+                                        ..default()
+                                    },
+                                    BorderRadius::all(Val::Px(6.0)),
+                                    BackgroundColor(Color::srgb(0.1, 0.6, 0.2)),
+                                    ButtonType::Download,
+                                    ButtonAction::Download {
+                                        name: item.name.clone(),
+                                        url: item.url.clone(),
+                                    },
+                                )).with_child((
+                                    Text::new("Download"),
+                                    TextFont {
+                                        font: fonts.semibold.clone(),
+                                        font_size: 12.0,
+                                        ..default()
+                                    },
+                                    TextColor(Color::WHITE),
+                                ));
+                            }
                         });
                     });
                 }
@@ -1514,6 +1693,49 @@ fn update_tab_buttons(
                 }
             }
         }
+    }
+}
+
+fn process_download_returns(
+    download_channel: Res<DownloadChannel>,
+    mut active_downloads: ResMut<ActiveDownloads>,
+    mut config: ResMut<LauncherConfig>,
+    running: Res<RunningProcesses>,
+    mut ui_events: EventWriter<UpdateUiEvent>,
+) {
+    let rx = download_channel.rx.lock().unwrap();
+    while let Ok(res) = rx.try_recv() {
+        active_downloads.names.remove(&res.name);
+
+        match res.result {
+            Ok(()) => {
+                println!("Successfully downloaded {} to {}", res.name, res.path.display());
+
+                // Add to configuration if not present
+                if !config.projects.iter().any(|p| p.path == res.path) {
+                    let new_proj = Project {
+                        name: res.name.clone(),
+                        path: res.path.clone(),
+                        last_launched: None,
+                    };
+                    config.projects.push(new_proj);
+                    save_config(&config);
+                }
+
+                // Initialize status
+                let project_type = detect_project_type(&res.path);
+                let status = if project_type == ProjectType::Invalid {
+                    ProjectStatus::Invalid
+                } else {
+                    ProjectStatus::Idle
+                };
+                running.statuses.lock().unwrap().insert(res.path.clone(), status);
+            }
+            Err(e) => {
+                println!("Failed to download {}: {}", res.name, e);
+            }
+        }
+        ui_events.send(UpdateUiEvent);
     }
 }
 
