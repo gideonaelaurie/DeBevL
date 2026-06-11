@@ -73,6 +73,7 @@ enum ProjectStatus {
     Idle,
     Running,
     FailedLaunch,
+    Invalid,
 }
 
 #[derive(Resource)]
@@ -418,7 +419,12 @@ fn init_launcher(
 ) {
     let mut statuses = running.statuses.lock().unwrap();
     for project in &config.projects {
-        statuses.insert(project.path.clone(), ProjectStatus::Idle);
+        let status = if detect_project_type(&project.path) == ProjectType::Invalid {
+            ProjectStatus::Invalid
+        } else {
+            ProjectStatus::Idle
+        };
+        statuses.insert(project.path.clone(), status);
     }
     ui_events.send(UpdateUiEvent);
 }
@@ -496,21 +502,24 @@ fn process_dialog_returns(
 ) {
     let rx = dialog_channel.rx.lock().unwrap();
     if let Ok(path) = rx.try_recv() {
-        // Resolve absolute path
-        let Ok(absolute_path) = std::fs::canonicalize(&path) else {
-            return;
-        };
+        println!("Selected folder path: {}", path.display());
+        
+        // Resolve absolute path safely
+        let absolute_path = std::fs::canonicalize(&path).unwrap_or(path);
 
         // Check if already in config
         if config.projects.iter().any(|p| p.path == absolute_path) {
+            println!("Path {} is already in history", absolute_path.display());
             return;
         }
 
         let project_type = detect_project_type(&absolute_path);
-        if project_type == ProjectType::Invalid {
-            println!("Error: Path {} is not a Bevy game folder (no Cargo.toml or executable found).", absolute_path.display());
-            return;
-        }
+        let status = if project_type == ProjectType::Invalid {
+            println!("Warning: Path {} is not a standard Bevy game folder (no Cargo.toml or executable found).", absolute_path.display());
+            ProjectStatus::Invalid
+        } else {
+            ProjectStatus::Idle
+        };
 
         let name = absolute_path
             .file_name()
@@ -527,7 +536,7 @@ fn process_dialog_returns(
         save_config(&config);
 
         // Initialize status
-        running.statuses.lock().unwrap().insert(absolute_path, ProjectStatus::Idle);
+        running.statuses.lock().unwrap().insert(absolute_path, status);
 
         ui_events.send(UpdateUiEvent);
     }
@@ -860,6 +869,12 @@ fn update_ui_list(
                             Color::srgba(0.75, 0.08, 0.08, 0.12),
                             Color::srgba(0.8, 0.12, 0.12, 0.4),
                             Color::srgb(0.95, 0.3, 0.3),
+                        ),
+                        ProjectStatus::Invalid => (
+                            "Invalid",
+                            Color::srgba(0.8, 0.4, 0.0, 0.12),
+                            Color::srgba(0.8, 0.45, 0.0, 0.4),
+                            Color::srgb(1.0, 0.6, 0.1),
                         ),
                     };
 
