@@ -358,7 +358,7 @@ fn setup_ui(mut commands: Commands, fonts: Res<AppFonts>) {
                 margin: UiRect::bottom(Val::Px(12.0)),
                 ..default()
             }).with_child((
-                Text::new("Recent Bevy Games"),
+                Text::new("My Bevy Games"),
                 TextFont {
                     font: fonts.semibold.clone(),
                     font_size: 16.0,
