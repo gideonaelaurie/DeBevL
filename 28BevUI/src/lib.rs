@@ -338,8 +338,8 @@ pub fn clean_readme(readme: &str) -> String {
 }
 
 pub fn setup_fonts(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
-    let regular_bytes = include_bytes!("../../assets/Roboto-Regular.ttf");
-    let semibold_bytes = include_bytes!("../../assets/Roboto-Medium.ttf");
+    let regular_bytes = include_bytes!("../assets/Roboto-Regular.ttf");
+    let semibold_bytes = include_bytes!("../assets/Roboto-Medium.ttf");
 
     let regular = fonts.add(Font::try_from_bytes(regular_bytes.to_vec()).unwrap());
     let semibold = fonts.add(Font::try_from_bytes(semibold_bytes.to_vec()).unwrap());
