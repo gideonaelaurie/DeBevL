@@ -20,8 +20,8 @@ pub struct LauncherConfig {
 pub fn get_config_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     let mut path = PathBuf::from(home);
-    path.push(".config");
-    path.push("debevl");
+    path.push(".debevl");
+    path.push("config");
     Some(path)
 }
 
